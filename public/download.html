@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Download Nusantara Ai</title>
+<style>
+  body {
+    font-family: 'Segoe UI', Arial, sans-serif;
+    background: linear-gradient(135deg, #1e1e2f, #2b2b45);
+    color: #fff;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    height: 100vh;
+    margin: 0;
+  }
+  .card {
+    background: #23233a;
+    padding: 40px;
+    border-radius: 16px;
+    box-shadow: 0 10px 30px rgba(0,0,0,0.4);
+    text-align: center;
+    width: 320px;
+  }
+  h1 {
+    font-size: 22px;
+    margin-bottom: 20px;
+  }
+  select {
+    width: 100%;
+    padding: 10px;
+    border-radius: 8px;
+    border: none;
+    margin-bottom: 20px;
+    font-size: 16px;
+    background: #33334f;
+    color: #fff;
+  }
+  button {
+    width: 100%;
+    padding: 12px;
+    border: none;
+    border-radius: 8px;
+    background: #4f8cff;
+    color: #fff;
+    font-size: 16px;
+    font-weight: bold;
+    cursor: pointer;
+    transition: background 0.2s;
+  }
+  button:hover {
+    background: #3a6fd6;
+  }
+</style>
+</head>
+<body>
+
+<div class="card">
+  <h1>Download Nusantara Ai</h1>
+  <select id="osSelect">
+    <option value="android">Android</option>
+    <option value="windows">Windows</option>
+  </select>
+  <button onclick="downloadApp()">Download</button>
+</div>
+
+<script>
+  function downloadApp() {
+    const os = document.getElementById('osSelect').value;
+    if (os === 'android') {
+      window.open('MindbotGenius.apk', '_blank');
+    } else if (os === 'windows') {
+      window.open('https://github.com/arzikivirend-lucu/Mindbot-genius-Ai/releases/download/latest-exe/Mindbot-Genius-Setup.exe', '_blank');
+    }
+  }
+</script>
+
+</body>
+</html>

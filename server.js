@@ -1,0 +1,860 @@
+require('dotenv').config();
+const express = require('express');
+const multer  = require('multer');
+const path    = require('path');
+const crypto  = require('crypto');
+
+// ── Supabase admin client (server-side, pakai service_role key) ──
+let supabaseAdmin = null;
+try {
+  const { createClient } = require('@supabase/supabase-js');
+  if (process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY) {
+    supabaseAdmin = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
+  } else {
+    console.warn('⚠️  SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY belum diset. Verifikasi email dinonaktifkan.');
+  }
+} catch (e) {
+  console.warn('⚠️  Paket "@supabase/supabase-js" belum ter-install. Jalankan: npm install @supabase/supabase-js');
+}
+
+// ── SMTP transporter (Gmail / Resend / SMTP lain) ──
+let mailTransporter = null;
+try {
+  const nodemailer = require('nodemailer');
+  if (process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS) {
+    mailTransporter = nodemailer.createTransport({
+      host: process.env.SMTP_HOST,
+      port: Number(process.env.SMTP_PORT || 465),
+      secure: Number(process.env.SMTP_PORT || 465) === 465,
+      auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS }
+    });
+  } else {
+    console.warn('⚠️  SMTP_HOST / SMTP_USER / SMTP_PASS belum diset. Email verifikasi tidak akan terkirim.');
+  }
+} catch (e) {
+  console.warn('⚠️  Paket "nodemailer" belum ter-install. Jalankan: npm install nodemailer');
+}
+
+const APP_URL = process.env.APP_URL || 'https://mindbot-genius-ai.vercel.app';
+const VERIFY_TOKEN_TTL_MS = 60 * 60 * 1000; // 1 jam
+
+async function sendVerificationEmail(email, token) {
+  if (!mailTransporter) throw new Error('SMTP belum dikonfigurasi di server.');
+  const link = `${APP_URL}/api/verify-email?token=${token}`;
+  await mailTransporter.sendMail({
+    from: process.env.SMTP_FROM || process.env.SMTP_USER,
+    to: email,
+    subject: 'Verifikasi akun Nusantara Ai',
+    html: `
+      <div style="font-family:sans-serif;max-width:480px;margin:auto;">
+        <h2>Verifikasi akun kamu</h2>
+        <p>Terima kasih sudah daftar di Nusantara Ai. Klik tombol di bawah untuk memverifikasi email kamu:</p>
+        <p style="margin:24px 0;">
+          <a href="${link}" style="background:#1a4fc4;color:#fff;padding:10px 20px;border-radius:8px;text-decoration:none;">Verifikasi Email</a>
+        </p>
+        <p>Atau salin link ini ke browser: <br/>${link}</p>
+        <p style="color:#888;font-size:12px;">Link berlaku 1 jam. Kalau kamu tidak merasa mendaftar, abaikan email ini.</p>
+      </div>
+    `
+  });
+}
+
+// AdmZip opsional
+let AdmZip = null;
+try {
+  AdmZip = require('adm-zip');
+} catch (e) {
+  console.warn('⚠️  Paket "adm-zip" belum ter-install. Fitur baca ZIP dinonaktifkan.');
+}
+
+const app = express();
+const sessions = {};
+
+// ── Ekstensi teks yang boleh dibaca ──
+const TEXT_EXTENSIONS = [
+  '.js','.jsx','.mjs','.cjs','.ts','.tsx','.html','.htm','.css','.scss','.sass',
+  '.json','.xml','.csv','.tsv','.md','.markdown','.py','.java','.c','.cpp','.h',
+  '.hpp','.cs','.php','.rb','.go','.rs','.sh','.bash','.yml','.yaml','.sql',
+  '.txt','.log','.ini','.toml','.env','.svg','.vue','.svelte','.graphql'
+];
+
+function isTextLike(mimetype, filename) {
+  const ext = path.extname(filename || '').toLowerCase();
+  if (TEXT_EXTENSIONS.includes(ext)) return true;
+  if (mimetype && (
+    mimetype.startsWith('text/') ||
+    ['application/json','application/javascript','application/xml','application/x-yaml','application/x-sh'].includes(mimetype)
+  )) return true;
+  return false;
+}
+
+function isZipLike(mimetype, filename) {
+  const ext = path.extname(filename || '').toLowerCase();
+  return ext === '.zip' || (mimetype && mimetype.includes('zip'));
+}
+
+function readZipSummary(buffer, maxFiles = 25, maxCharsPerFile = 1500, maxTotalChars = 12000) {
+  if (!AdmZip) return null;
+  try {
+    const zip = new AdmZip(buffer);
+    const entries = zip.getEntries();
+    let out = `[Isi arsip ZIP — ${entries.length} entri]\n\n`;
+    const fileList = entries.map(e => (e.isDirectory ? '📁 ' : '📄 ') + e.entryName).join('\n');
+    out += 'Struktur file:\n' + fileList.slice(0, 3000) + (fileList.length > 3000 ? '\n... (dipotong)' : '') + '\n\n';
+    let shown = 0;
+    let totalChars = out.length;
+    for (const entry of entries) {
+      if (entry.isDirectory) continue;
+      if (shown >= maxFiles || totalChars >= maxTotalChars) break;
+      const ext = path.extname(entry.entryName).toLowerCase();
+      if (!TEXT_EXTENSIONS.includes(ext)) continue;
+      if (entry.header.size > 200 * 1024) continue;
+      try {
+        const content = entry.getData().toString('utf-8').slice(0, maxCharsPerFile);
+        out += `--- ${entry.entryName} ---\n${content}\n\n`;
+        totalChars += content.length + entry.entryName.length + 10;
+        shown++;
+      } catch (e) {}
+    }
+    if (shown === 0) out += '(Tidak ada file teks yang bisa ditampilkan isinya)\n';
+    return out.slice(0, maxTotalChars + 3000);
+  } catch (e) {
+    console.error('Zip read error:', e.message);
+    return null;
+  }
+}
+
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 20 * 1024 * 1024 },
+  fileFilter: (req, file, cb) => {
+    const ext = path.extname(file.originalname || '').toLowerCase();
+    const okMimes = [
+      'image/jpeg','image/png','image/gif','image/webp',
+      'text/plain','application/pdf',
+      'text/html','text/css','text/csv','text/markdown','text/xml',
+      'application/json','application/javascript','text/javascript',
+      'application/xml','application/x-yaml','application/zip',
+      'application/x-zip-compressed','application/octet-stream'
+    ];
+    const okExts = TEXT_EXTENSIONS.concat(['.zip']);
+    cb(null, okMimes.includes(file.mimetype) || okExts.includes(ext));
+  }
+});
+
+app.use(express.json());
+app.use(express.static(path.join(__dirname, 'public')));
+
+// ── Kirim / kirim-ulang email verifikasi ──
+app.post('/api/send-verification', async (req, res) => {
+  try {
+    if (!supabaseAdmin) return res.status(500).json({ error: 'Supabase admin belum dikonfigurasi di server.' });
+    const { userId, email } = req.body || {};
+    if (!userId || !email) return res.status(400).json({ error: 'userId dan email wajib diisi.' });
+
+    const token = crypto.randomBytes(32).toString('hex');
+    const expiresAt = new Date(Date.now() + VERIFY_TOKEN_TTL_MS).toISOString();
+
+    const { error: upsertError } = await supabaseAdmin
+      .from('email_verifications')
+      .upsert({ user_id: userId, email, token, expires_at: expiresAt, verified: false }, { onConflict: 'user_id' });
+    if (upsertError) throw upsertError;
+
+    await sendVerificationEmail(email, token);
+    res.json({ ok: true, message: 'Email verifikasi terkirim. Cek inbox (atau folder spam).' });
+  } catch (e) {
+    console.error('send-verification error:', e.message);
+    res.status(500).json({ error: e.message || 'Gagal mengirim email verifikasi.' });
+  }
+});
+
+// ── Klik link di email -> verifikasi token ──
+app.get('/api/verify-email', async (req, res) => {
+  try {
+    if (!supabaseAdmin) return res.redirect(`${APP_URL}/?verified=0&reason=server`);
+    const { token } = req.query;
+    if (!token) return res.redirect(`${APP_URL}/?verified=0&reason=missing`);
+
+    const { data: row, error } = await supabaseAdmin
+      .from('email_verifications')
+      .select('user_id, expires_at, verified')
+      .eq('token', token)
+      .maybeSingle();
+    if (error) throw error;
+    if (!row) return res.redirect(`${APP_URL}/?verified=0&reason=invalid`);
+    if (new Date(row.expires_at).getTime() < Date.now()) return res.redirect(`${APP_URL}/?verified=0&reason=expired`);
+
+    if (!row.verified) {
+      const { error: updateError } = await supabaseAdmin
+        .from('email_verifications')
+        .update({ verified: true })
+        .eq('token', token);
+      if (updateError) throw updateError;
+    }
+    res.redirect(`${APP_URL}/?verified=1`);
+  } catch (e) {
+    console.error('verify-email error:', e.message);
+    res.redirect(`${APP_URL}/?verified=0&reason=error`);
+  }
+});
+
+// ── Cek status verifikasi (dipanggil dari frontend) ──
+app.get('/api/verification-status/:userId', async (req, res) => {
+  try {
+    if (!supabaseAdmin) return res.json({ verified: false });
+    const { data, error } = await supabaseAdmin
+      .from('email_verifications')
+      .select('verified')
+      .eq('user_id', req.params.userId)
+      .maybeSingle();
+    if (error) throw error;
+    res.json({ verified: !!(data && data.verified) });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Dummy endpoints
+app.get('/api/conversations', (req, res) => res.json([]));
+app.get('/api/conversations/:id', (req, res) => res.status(404).json({ error: 'Tidak ditemukan' }));
+app.delete('/api/conversations/:id', (req, res) => res.json({ ok: true }));
+
+// ── WEB SEARCH ──
+const NEWS_KEYWORDS = [
+  'berita','terkini','terbaru','hari ini','sekarang','minggu ini','bulan ini',
+  'update','breaking','news','today','latest','current','recently','happened',
+  'siapa presiden','siapa pemimpin','harga','nilai tukar','kurs','cuaca',
+  'gempa','banjir','kebakaran','kecelakaan','meninggal','wafat','terpilih',
+  'pertandingan','skor','hasil','juara','menang','kalah'
+];
+
+function needsWebSearch(text) {
+  const lower = text.toLowerCase();
+  return NEWS_KEYWORDS.some(kw => lower.includes(kw));
+}
+
+async function searchWeb(query) {
+  try {
+    const TAVILY_KEY = process.env.TAVILY_API_KEY;
+    if (!TAVILY_KEY) return null;
+    const resp = await fetch('https://api.tavily.com/search', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        api_key: TAVILY_KEY,
+        query: query,
+        search_depth: 'basic',
+        max_results: 5,
+        include_answer: true
+      })
+    });
+    if (!resp.ok) return null;
+    const data = await resp.json();
+    let context = `[Hasil pencarian web untuk: "${query}"]\n\n`;
+    if (data.answer) context += `Ringkasan: ${data.answer}\n\n`;
+    if (data.results?.length) {
+      context += 'Sumber:\n';
+      data.results.slice(0,3).forEach((r, i) => {
+        context += `${i+1}. ${r.title}\n   ${r.content?.slice(0,300)}...\n   URL: ${r.url}\n\n`;
+      });
+    }
+    return context;
+  } catch(e) {
+    console.error('Search error:', e.message);
+    return null;
+  }
+}
+
+// ── URL OPEN / EXTRACT ──
+const URL_REGEX = /https?:\/\/[^\s<>"')\]]+/gi;
+
+function extractUrls(text) {
+  if (!text) return [];
+  const matches = text.match(URL_REGEX) || [];
+  return [...new Set(matches.map(u => u.replace(/[.,;:!?)]+$/, '')))].slice(0, 3);
+}
+
+function stripHtml(html) {
+  return html
+    .replace(/<script[\s\S]*?<\/script>/gi, '')
+    .replace(/<style[\s\S]*?<\/style>/gi, '')
+    .replace(/<noscript[\s\S]*?<\/noscript>/gi, '')
+    .replace(/<!--[\s\S]*?-->/g, '')
+    .replace(/<\/?(?:p|div|br|h[1-6]|li|tr)[^>]*>/gi, '\n')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/\s+/g, ' ')
+    .replace(/\n\s*\n/g, '\n')
+    .trim();
+}
+
+async function fetchPageContentNative(url, maxChars = 12000) {
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 8000);
+    const resp = await fetch(url, {
+      signal: controller.signal,
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (compatible; NusantaraAi/1.0; +https://mindbot-genius-ai.vercel.app)',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'id,en;q=0.9'
+      },
+      redirect: 'follow'
+    });
+    clearTimeout(timer);
+    if (!resp.ok) return null;
+    const ct = (resp.headers.get('content-type') || '').toLowerCase();
+    if (!ct.includes('text/') && !ct.includes('html') && !ct.includes('xml') && !ct.includes('json')) {
+      return `[URL: ${url}]\nTipe konten tidak didukung untuk dibaca teks (${ct || 'unknown'}).`;
+    }
+    const raw = await resp.text();
+    if (ct.includes('json')) {
+      return `[Isi JSON dari ${url}]\n${raw.slice(0, maxChars)}`;
+    }
+    const text = stripHtml(raw).slice(0, maxChars);
+    if (!text || text.length < 40) return null;
+    return `[Isi halaman: ${url}]\n${text}`;
+  } catch (e) {
+    console.warn('Native fetch gagal:', url, e.message);
+    return null;
+  }
+}
+
+async function fetchPageContentTavily(urls, query) {
+  const TAVILY_KEY = process.env.TAVILY_API_KEY;
+  if (!TAVILY_KEY || !urls.length) return null;
+  try {
+    const body = {
+      urls: urls.length === 1 ? urls[0] : urls,
+      extract_depth: 'basic'
+    };
+    if (query) body.query = query;
+    const resp = await fetch('https://api.tavily.com/extract', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${TAVILY_KEY}`
+      },
+      body: JSON.stringify(body)
+    });
+    if (!resp.ok) return null;
+    const data = await resp.json();
+    const results = data.results || [];
+    if (!results.length) return null;
+    let out = '';
+    for (const r of results) {
+      const content = (r.raw_content || r.content || '').trim();
+      if (!content) continue;
+      out += `[Isi halaman: ${r.url}]\n${content.slice(0, 10000)}\n\n`;
+    }
+    return out.trim() || null;
+  } catch (e) {
+    console.warn('Tavily extract error:', e.message);
+    return null;
+  }
+}
+
+async function openLinks(text) {
+  const urls = extractUrls(text);
+  if (!urls.length) return '';
+  console.log('🔗 Membuka link:', urls);
+  let content = await fetchPageContentTavily(urls, text.slice(0, 200));
+  if (content) {
+    console.log('✅ Konten berhasil diambil via Tavily');
+    return content;
+  }
+  const parts = [];
+  for (const url of urls) {
+    const part = await fetchPageContentNative(url);
+    if (part) parts.push(part);
+  }
+  if (parts.length) {
+    console.log('✅ Konten berhasil diambil via native fetch');
+    return parts.join('\n\n');
+  }
+  return `[Gagal membuka link: ${urls.join(', ')}. Mungkin situs memblokir bot atau butuh login.]`;
+}
+
+// ── IMAGE GENERATION (deAPI) ──
+const DEAPI_BASE  = 'https://api.deapi.ai/api/v1/client';
+const DEAPI_MODEL = 'ZImageTurbo_INT8';
+
+function deapiHeaders() {
+  return {
+    'Authorization': `Bearer ${process.env.DEAPI_API_KEY}`,
+    'Content-Type': 'application/json',
+    'Accept': 'application/json'
+  };
+}
+
+const RUNBIOS_BASE = 'https://api.runbios.ai/v1/chat/completions';
+const RUNBIOS_CODING_MODELS = [
+  'kimi-k2.7-code', // Nusantara Ai Pro v3.0
+  'kimi-k3'
+];
+
+// ── Kirim job gambar ke deAPI (dipakai /api/imagine dan Nusantara Ai Pro V5.0) ──
+async function submitImageJob(prompt) {
+  const DEAPI_KEY = process.env.DEAPI_API_KEY;
+  if (!DEAPI_KEY) throw new Error('DEAPI_API_KEY belum diset');
+  const submitResp = await fetch(`${DEAPI_BASE}/txt2img`, {
+    method: 'POST',
+    headers: deapiHeaders(),
+    body: JSON.stringify({
+      prompt: prompt + ', high quality, detailed, beautiful',
+      model: DEAPI_MODEL,
+      width: 768,
+      height: 512,
+      steps: 4,
+      seed: -1
+    })
+  });
+  if (!submitResp.ok) {
+    const errText = await submitResp.text();
+    throw new Error(`deAPI submit error (${submitResp.status}): ${errText}`);
+  }
+  const submitData = await submitResp.json();
+  const requestId = submitData?.data?.request_id;
+  if (!requestId) throw new Error('deAPI tidak mengembalikan request_id');
+  return requestId;
+}
+
+// ── Nusantara Ai Pro V5.0 ──
+// Model gabungan: memilih model terbaik per pesan (vision, coding, cepat, cerdas)
+// dan otomatis membuat gambar saat pengguna memintanya.
+const V5_MODEL = 'nusantara-ai-v5';
+
+const IMG_VERBS = '(?:di)?(?:buat(?:kan|in)?|bikin(?:kan|in)?|ciptakan|hasilkan|desain(?:kan)?|lukis(?:kan|in)?|generate|create|make|draw|paint|render|design|produce)';
+const IMG_NOUNS = '(?:gambar|foto|ilustrasi|lukisan|logo|poster|wallpaper|banner|sketsa|karakter|avatar|ikon|icon|stiker|sticker|image|picture|photo|illustration|artwork|drawing|sketch|painting|portrait|potret)';
+const IMG_GAP   = '(?:(?!tentang|mengenai|soal|about|untuk membuat)[^.!?\\n]){0,30}?';
+const IMAGE_REQUEST_RE = new RegExp(`\\b${IMG_VERBS}\\b${IMG_GAP}\\b${IMG_NOUNS}\\b`, 'i');
+const IMAGE_QUICK_RE   = /\b(gambarin|draw (?:me|a|an)|imagine:)\b/i;
+const NOT_IMAGE_CONTEXT_RE = /\b(html|css|javascript|js|kode|code|coding|script|python|react|canvas|svg|github|readme|deskripsi|caption|keterangan|alt text|analisis|jelaskan)\b/i;
+
+function isImageRequest(text) {
+  if (!text || text.length > 600) return false;
+  if (NOT_IMAGE_CONTEXT_RE.test(text)) return false;
+  return IMAGE_REQUEST_RE.test(text) || IMAGE_QUICK_RE.test(text);
+}
+
+// Ubah permintaan pengguna jadi prompt gambar bahasa Inggris (fallback: teks asli)
+async function buildImagePrompt(text) {
+  const GROQ_KEY = process.env.GROQ_API_KEY;
+  if (!GROQ_KEY) return text;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 3000);
+  try {
+    const resp = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${GROQ_KEY}` },
+      body: JSON.stringify({
+        model: 'openai/gpt-oss-20b',
+        messages: [
+          { role: 'system', content: 'Ubah permintaan pengguna menjadi SATU prompt pembuat gambar dalam bahasa Inggris, deskriptif (subjek, suasana, gaya, pencahayaan), maksimal 60 kata. Balas HANYA prompt-nya, tanpa tanda kutip atau penjelasan.' },
+          { role: 'user', content: text }
+        ],
+        max_tokens: 200,
+        temperature: 0.4,
+        reasoning_effort: 'low'
+      }),
+      signal: controller.signal
+    });
+    if (!resp.ok) return text;
+    const data = await resp.json();
+    let out = (data.choices?.[0]?.message?.content || '').replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
+    out = out.replace(/^["'“”]+|["'“”]+$/g, '').trim();
+    return out && out.length >= 5 ? out.slice(0, 500) : text;
+  } catch (e) {
+    return text;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// Pilih model terbaik untuk pesan ini (hanya model yang sudah ada di server)
+function pickV5Model({ text, isImage, hasWebContext }) {
+  if (isImage) return 'qwen/qwen3.6-27b';
+  const codeLike = /\b(html|css|javascript|js|kode|code|coding|script|python|java|php|react|node|sql|fungsi|function|program|bug|error|debug|game)\b/i.test(text || '');
+  if (codeLike && process.env.RUNBIOS_API_KEY) return 'kimi-k2.7-code';
+  const simple = (text || '').length < 60 && !hasWebContext && !/[?]\s*.{40,}/.test(text || '');
+  if (simple && !codeLike) return 'openai/gpt-oss-20b';
+  return 'openai/gpt-oss-120b';
+}
+
+// 1. Submit image job
+app.post('/api/imagine', async (req, res) => {
+  const { prompt } = req.body;
+  if (!prompt) return res.status(400).json({ error: 'Prompt diperlukan' });
+  try {
+    const requestId = await submitImageJob(prompt);
+    res.json({ requestId, status: 'pending' });
+  } catch (err) {
+    console.error('Imagine submit error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 2. Cek status image
+app.get('/api/imagine/status/:requestId', async (req, res) => {
+  const DEAPI_KEY = process.env.DEAPI_API_KEY;
+  if (!DEAPI_KEY) return res.status(500).json({ error: 'DEAPI_API_KEY belum diset' });
+  try {
+    const statusResp = await fetch(`${DEAPI_BASE}/request-status/${req.params.requestId}`, {
+      headers: deapiHeaders()
+    });
+    if (!statusResp.ok) {
+      const errText = await statusResp.text();
+      throw new Error(`deAPI status error (${statusResp.status}): ${errText}`);
+    }
+    const statusData = await statusResp.json();
+    const d = statusData?.data || statusData;
+    const rawStatus = (d?.status || '').toLowerCase();
+    const DONE_STATUSES   = ['done', 'completed', 'success', 'succeeded', 'finished'];
+    const FAILED_STATUSES = ['failed', 'error', 'cancelled'];
+    if (DONE_STATUSES.includes(rawStatus)) {
+      const imageUrl =
+        d?.result_url ||
+        d?.result?.url ||
+        d?.result?.[0]?.url ||
+        d?.result?.image_url ||
+        d?.output_url ||
+        d?.output?.[0]?.url ||
+        d?.output?.url ||
+        d?.url ||
+        d?.download_url ||
+        d?.assets?.[0]?.url ||
+        d?.results_alt_formats?.jpg ||
+        d?.results_alt_formats?.webp ||
+        null;
+      if (!imageUrl) {
+        return res.json({ status: 'done', imageUrl: null, debugRaw: statusData });
+      }
+      return res.json({ status: 'completed', imageUrl });
+    }
+    if (FAILED_STATUSES.includes(rawStatus)) {
+      return res.json({ status: 'failed', error: d?.error || d?.error_message || 'Gagal membuat gambar' });
+    }
+    res.json({ status: rawStatus || 'pending' });
+  } catch (err) {
+    console.error('Imagine status error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── MEMORY EXTRACT ──
+app.post('/api/memory/extract', async (req, res) => {
+  const { userText, aiText, existingMemory } = req.body;
+  if (!userText && !aiText) return res.json({ facts: [] });
+  const GROQ_KEY = process.env.GROQ_API_KEY;
+  if (!GROQ_KEY) return res.json({ facts: [] });
+  const existing = Array.isArray(existingMemory) ? existingMemory.slice(0, 60) : [];
+  const extractPrompt = `Kamu bertugas mengekstrak fakta PENTING dan TAHAN LAMA tentang pengguna dari potongan percakapan berikut, untuk disimpan sebagai memori jangka panjang asisten AI.
+Hanya ambil fakta seperti: nama pengguna, pekerjaan/proyek yang sedang dikerjakan, preferensi personal, informasi identitas yang relevan, tujuan jangka panjang, atau konteks penting lain yang kemungkinan berguna di percakapan mendatang.
+JANGAN ambil hal yang sifatnya sesaat (pertanyaan sekali pakai, small talk, permintaan teknis satu kali, atau hal yang sudah tercakup dalam memori yang sudah ada).
+Memori yang SUDAH ada (jangan ulangi jika sudah tercakup):
+${existing.length ? existing.map(f => '- ' + f).join('\n') : '(belum ada)'}
+Percakapan baru:
+User: "${(userText || '').slice(0, 500)}"
+AI: "${(aiText || '').slice(0, 500)}"
+Balas HANYA dengan array JSON berisi string fakta baru yang layak diingat (maksimal 3 item, singkat dan jelas, dalam Bahasa Indonesia). Jika tidak ada fakta baru yang layak diingat, balas dengan array kosong [].
+Contoh format balasan: ["Nama pengguna adalah Budi", "Sedang mengerjakan aplikasi toko online"]`;
+  try {
+    const resp = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${GROQ_KEY}` },
+      body: JSON.stringify({
+        model: 'openai/gpt-oss-20b',
+        messages: [{ role: 'user', content: extractPrompt }],
+        max_tokens: 300,
+        temperature: 0.2
+      }),
+    });
+    if (!resp.ok) return res.json({ facts: [] });
+    const data = await resp.json();
+    let raw = data.choices?.[0]?.message?.content || '[]';
+    raw = raw.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
+    const match = raw.match(/\[[\s\S]*\]/);
+    let facts = [];
+    if (match) {
+      try { facts = JSON.parse(match[0]); } catch (e) { facts = []; }
+    }
+    if (!Array.isArray(facts)) facts = [];
+    facts = facts.filter(f => typeof f === 'string' && f.trim().length > 0).slice(0, 3);
+    res.json({ facts });
+  } catch (err) {
+    console.error('Memory extract error:', err.message);
+    res.json({ facts: [] });
+  }
+});
+
+// ── SAFE UPLOAD ──
+function safeUpload(req, res, next) {
+  upload.single('file')(req, res, (err) => {
+    if (err) {
+      console.error('Upload error:', err.message);
+      const msg = err.code === 'LIMIT_FILE_SIZE'
+        ? 'Ukuran file terlalu besar (maksimal 20MB)'
+        : (err.message || 'Gagal mengunggah file');
+      return res.status(400).json({ error: msg });
+    }
+    next();
+  });
+}
+
+// ── CHAT ──
+app.post('/api/chat', safeUpload, async (req, res) => {
+  const { message, sessionId, model: reqModel, memory } = req.body;
+  if (!sessionId) return res.status(400).json({ error: 'sessionId diperlukan' });
+  const text = message || '';
+  const file  = req.file;
+  if (!text && !file) return res.status(400).json({ error: 'Pesan atau file diperlukan' });
+  if (!sessions[sessionId]) sessions[sessionId] = [];
+
+  // ── Nusantara Ai Pro V5.0: permintaan membuat gambar -> kirim job ke deAPI, frontend yang polling ──
+  const isV5 = reqModel === V5_MODEL;
+  if (isV5 && !file && isImageRequest(text)) {
+    try {
+      const imagePrompt = await buildImagePrompt(text);
+      const imageRequestId = await submitImageJob(imagePrompt);
+      sessions[sessionId].push({ role: 'user', content: text });
+      sessions[sessionId].push({ role: 'assistant', content: `[Gambar dibuat untuk permintaan: "${text.slice(0, 120)}"]` });
+      return res.json({
+        reply: `🎨 **"${text.slice(0, 120)}"**`,
+        title: text.slice(0, 40),
+        imageRequestId,
+        route: 'image'
+      });
+    } catch (err) {
+      console.error('V5 image error:', err.message);
+      return res.status(500).json({ error: 'Gagal membuat gambar: ' + err.message });
+    }
+  }
+
+  const isImage = file && file.mimetype.startsWith('image/');
+  const isZip   = file && !isImage && isZipLike(file.mimetype, file.originalname);
+  const isText  = file && !isImage && !isZip && isTextLike(file.mimetype, file.originalname);
+
+  let groqContent, displayText = text;
+  if (isImage) {
+    const b64 = file.buffer.toString('base64');
+    groqContent = [
+      { type:'image_url', image_url:{ url:`data:${file.mimetype};base64,${b64}` } },
+      { type:'text', text: text||'Tolong analisis gambar ini.' }
+    ];
+    displayText = text||'Analisis gambar ini.';
+  } else if (isZip) {
+    const zipSummary = readZipSummary(file.buffer);
+    if (zipSummary) {
+      groqContent = text
+        ? `${text}\n\n[File ZIP: "${file.originalname}"]\n${zipSummary}`
+        : `Analisis isi file ZIP ini:\n\n${zipSummary}`;
+    } else {
+      groqContent = text
+        ? `${text}\n\n[File ZIP: "${file.originalname}" — gagal dibaca]`
+        : `File ZIP "${file.originalname}" gagal dibaca.`;
+    }
+    displayText = text || `🗜️ ${file.originalname}`;
+  } else if (isText) {
+    const fc = file.buffer.toString('utf-8').slice(0,8000);
+    groqContent = text ? `${text}\n\n[File: "${file.originalname}"]\n${fc}` : `Analisis file ini:\n\n${fc}`;
+    displayText = text||`📄 ${file.originalname}`;
+  } else if (file) {
+    groqContent = text
+      ? `${text}\n\n[File "${file.originalname}" diterima, tipe tidak didukung untuk dibaca isinya.]`
+      : `File "${file.originalname}" diterima, tipe tidak didukung.`;
+    displayText = text || `📎 ${file.originalname}`;
+  } else {
+    groqContent = text;
+  }
+
+  // Web search
+  let webContext = '';
+  if (text && needsWebSearch(text)) {
+    console.log('🔍 Mencari:', text);
+    const result = await searchWeb(text);
+    if (result) {
+      webContext = result;
+      console.log('✅ Web search berhasil');
+    }
+  }
+
+  // ── Buka link jika user mengirim URL ──
+  let linkContext = '';
+  if (text && extractUrls(text).length) {
+    linkContext = await openLinks(text);
+  }
+
+  // Memory
+  let memoryContext = '';
+  if (memory) {
+    try {
+      const memArr = JSON.parse(memory);
+      if (Array.isArray(memArr) && memArr.length) {
+        memoryContext = '\n\nBerikut hal-hal yang kamu ingat tentang pengguna ini dari percakapan sebelumnya:\n'
+          + memArr.slice(0, 60).map(f => '- ' + f).join('\n')
+          + '\nGunakan informasi ini secara alami jika relevan.';
+      }
+    } catch (e) {}
+  }
+
+  sessions[sessionId].push({ role:'user', content: displayText });
+
+  const ALLOWED_MODELS = [
+    'openai/gpt-oss-120b',
+    'openai/gpt-oss-20b',
+    'qwen/qwen3.6-27b',
+    'kimi-k2.7-code',
+    'kimi-k3'
+  ];
+  const requestedModel = isV5
+    ? pickV5Model({ text, isImage: !!isImage, hasWebContext: !!(webContext || linkContext) })
+    : (ALLOWED_MODELS.includes(reqModel) ? reqModel : 'openai/gpt-oss-120b');
+
+  const model = isImage
+    ? 'qwen/qwen3.6-27b'
+    : requestedModel;
+
+  const useRunBios = RUNBIOS_CODING_MODELS.includes(model);
+
+  // Jangan asumsikan setiap pesan yang dikirim saat model coding aktif itu
+  // permintaan kode — basa-basi seperti "Halo" tidak perlu (dan tidak boleh)
+  // menunggu RunBios sama sekali.
+  const looksLikeCodeRequest = !!text && /html|game|kode|code|css|javascript|python|script|buatkan|bikin|make me|buat|fungsi|function|program/i.test(text);
+  const routeToRunBios = useRunBios && looksLikeCodeRequest;
+
+  const codingExtra = useRunBios
+    ? ` Saat diminta membuat kode (HTML/CSS/JS/Python/dll), ikuti aturan ini DENGAN KETAT:
+1) Tulis kode LENGKAP yang langsung bisa dijalankan.
+2) PENTING SPEED: untuk game/HTML, buat SATU file mini (inline CSS+JS), MAKSIMAL 40 baris, tanpa komentar panjang.
+3) Jangan buat canvas game kompleks / particle / banyak level — pilih mekanik sederhana (klik, tebak angka, counter, snake mini).
+4) Bungkus kode dengan markdown fence, contoh: \`\`\`html ... \`\`\`.
+5) Jangan kirim HTML/JS mentah tanpa fence.
+6) Penjelasan maksimal 1 kalimat sebelum kode.`
+    : '';
+
+  const v5Extra = isV5
+    ? ' Kamu adalah Nusantara Ai Pro V5.0, gabungan seluruh kemampuan Nusantara Ai: percakapan, coding, analisis gambar, pencarian web, dan pembuatan gambar. Jika pengguna meminta dibuatkan gambar, sistem membuatnya otomatis.'
+    : '';
+
+  const systemPrompt = `Kamu adalah Nusantara Ai asisten AI cerdas buatan Arziki. Jangan sebut model AI lain. Jawab dalam bahasa yang sama dengan pengguna. Tanggal hari ini: ${new Date().toLocaleDateString('id-ID', {weekday:'long',year:'numeric',month:'long',day:'numeric'})}.${codingExtra}${v5Extra}${memoryContext}${webContext ? '\n\nGunakan informasi berikut untuk menjawab pertanyaan user:\n'+webContext : ''}${linkContext ? '\n\nPengguna mengirim link. Berikut isi halaman yang berhasil dibuka (gunakan ini untuk menjawab):\n'+linkContext : ''}`;
+
+  try {
+    const history = sessions[sessionId].slice(-20);
+    const messages = [
+      { role:'system', content: systemPrompt },
+      ...history.slice(0,-1).map(m => ({ role: m.role, content: m.content })),
+      { role:'user', content: isImage ? groqContent : (webContext || linkContext ? `${text}\n\n${webContext || ''}${linkContext ? '\n'+linkContext : ''}` : groqContent) }
+    ];
+
+    const apiUrl = routeToRunBios
+      ? RUNBIOS_BASE
+      : 'https://api.groq.com/openai/v1/chat/completions';
+    const apiKey = routeToRunBios
+      ? process.env.RUNBIOS_API_KEY
+      : process.env.GROQ_API_KEY;
+
+    // Model yang benar-benar dikirim ke API
+    let effectiveModel;
+    if (routeToRunBios) {
+      effectiveModel = model;                 // kimi-k2.7-code / kimi-k3
+    } else if (isImage) {
+      effectiveModel = 'qwen/qwen3.6-27b';    // vision
+    } else {
+      effectiveModel = (isV5 && model === 'openai/gpt-oss-20b') ? 'openai/gpt-oss-20b' : 'openai/gpt-oss-120b'; // fallback aman ke Groq
+    }
+
+    if (routeToRunBios && !apiKey) throw new Error('RUNBIOS_API_KEY belum diset di server');
+    if (!routeToRunBios && !apiKey) throw new Error('GROQ_API_KEY belum diset di server');
+
+    // Tambahan instruksi brevity untuk coding
+    if (routeToRunBios) {
+      const brevity = '\n\n[SISTEM STRICT]: Balas HANYA 1 fence markdown. File HTML lengkap (inline CSS+JS). MAKSIMAL 40 baris. Tanpa penjelasan panjang, tanpa komentar, tanpa particle/canvas kompleks. Mekanik paling sederhana saja.';
+      const last = messages[messages.length - 1];
+      if (last && last.role === 'user' && typeof last.content === 'string') {
+        last.content = last.content + brevity;
+      }
+    }
+
+    const maxTokens = routeToRunBios ? 1024 : 3072;
+
+    async function callChat(url, key, mdl, tok, timeoutMs) {
+      const controller = new AbortController();
+      const timer = timeoutMs ? setTimeout(() => controller.abort(), timeoutMs) : null;
+      try {
+        const r = await fetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type':'application/json', 'Authorization':`Bearer ${key}` },
+          body: JSON.stringify({ model: mdl, messages, max_tokens: tok }),
+          signal: controller.signal
+        });
+        if (!r.ok) {
+          const e = await r.json().catch(() => ({}));
+          throw new Error(e.error?.message || e.detail || e.error || ('API error ' + r.status));
+        }
+        const d = await r.json();
+        const content = d.choices?.[0]?.message?.content || '';
+        if (!content) throw new Error('Model mengembalikan balasan kosong');
+        return content;
+      } catch (err) {
+        if (err.name === 'AbortError') throw new Error(`Timeout setelah ${timeoutMs}ms`);
+        throw err;
+      } finally {
+        if (timer) clearTimeout(timer);
+      }
+    }
+
+    let reply;
+    if (routeToRunBios) {
+      const groqKey = process.env.GROQ_API_KEY;
+      try {
+        reply = await callChat(apiUrl, apiKey, effectiveModel, maxTokens, 6000);
+      } catch (e) {
+        console.warn('RunBios lambat/gagal, fallback Groq:', e.message);
+        if (!groqKey) throw new Error('RunBios timeout/gagal dan GROQ_API_KEY belum diset');
+        reply = await callChat(
+          'https://api.groq.com/openai/v1/chat/completions',
+          groqKey,
+          'openai/gpt-oss-120b',
+          768,
+          3000
+        );
+      }
+    } else {
+      try {
+        reply = await callChat(apiUrl, apiKey, effectiveModel, maxTokens, effectiveModel === 'openai/gpt-oss-20b' ? 5000 : 12000);
+      } catch (e) {
+        // Nusantara Ai Pro V5.0: kalau model cepat gagal, naik ke model utama
+        if (!(isV5 && effectiveModel === 'openai/gpt-oss-20b')) throw e;
+        console.warn('Model cepat gagal, fallback ke gpt-oss-120b:', e.message);
+        reply = await callChat(apiUrl, apiKey, 'openai/gpt-oss-120b', maxTokens, 8000);
+      }
+    }
+
+    sessions[sessionId].push({ role:'assistant', content: reply });
+    if (sessions[sessionId].length > 40) sessions[sessionId] = sessions[sessionId].slice(-40);
+
+    const title = text.slice(0,40) || (file ? `📎 ${file.originalname}` : 'Percakapan');
+    res.json({
+      reply,
+      title,
+      searched: !!webContext || !!linkContext
+    });
+  } catch(err) {
+    console.error(err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Error handler terakhir
+app.use((err, req, res, next) => {
+  console.error('Unhandled error:', err);
+  if (res.headersSent) return next(err);
+  res.status(500).json({ error: err.message || 'Terjadi kesalahan pada server' });
+});
+
+// JANGAN app.listen() di Vercel
+module.exports = app;

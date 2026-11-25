@@ -1,0 +1,14 @@
+{
+  "appId": "com.binaryglobalnetwork.mindbotgenius",
+  "appName": "Nusantara Ai",
+  "webDir": "www",
+  "server": {
+    "url": "https://chatgpt.com",
+    "cleartext": false,
+    "androidScheme": "https"
+  },
+  "android": {
+    "backgroundColor": "#0a0c14",
+    "allowMixedContent": false
+  }
+}
